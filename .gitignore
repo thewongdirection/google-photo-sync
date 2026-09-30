@@ -1,0 +1,5 @@
+config.json
+client_secret*.json
+*.log
+*.part
+*.gpsync-tmp

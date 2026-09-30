@@ -1,0 +1,17 @@
+{
+    "_comment": "Copy to config.json and edit. Backslashes must be doubled in JSON, e.g. \\\\nas\\photos",
+
+    "Destination": "\\\\nas\\photos\\Google Photos",
+
+    "ClientSecretFile": "client_secret.json",
+
+    "StagingDirectory": "%LOCALAPPDATA%\\GooglePhotosSync\\staging",
+    "StateDirectory": "%LOCALAPPDATA%\\GooglePhotosSync",
+
+    "ExportSelection": "Latest",
+    "ProductFolder": "",
+    "CollisionTag": "gphotos-collision",
+    "SetFileTimes": true,
+    "CopyJsonSidecars": false,
+    "DeleteStagedArchives": true
+}
