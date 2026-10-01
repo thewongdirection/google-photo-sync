@@ -11,6 +11,57 @@ It needs nothing beyond what ships with Windows 10/11: Windows PowerShell 5.1 or
 > whole Google Photos library. Google Takeout is the practical way to get a full copy, and this
 > script automates everything around it.
 
+## Why use this instead of doing it by hand?
+
+You still have to create the Takeout export yourself, so that step is the same either way. The
+script takes over the work after that:
+
+| Manual job | What the script does |
+|---|---|
+| Download each archive part in a browser. For a big library that's dozens of 50 GB files, and Takeout download links expire after 7 days. | Pulls the parts straight from Drive. Downloads resume if interrupted and are checked against Google's checksum. |
+| Unzip every part and merge the folders. A photo's `.json` metadata file can land in a different part from the photo. | Reads the zips directly and merges all parts into one folder layout, with no manual unzipping. Metadata that sits in a different part from its photo is still matched. |
+| File dates: Takeout stamps files with the export date, not when the photo was taken, so everything sorts wrongly. Fixing this by hand means reading the `.json` files, which isn't realistic. | Sets each file's date from the "photo taken" time in its `.json` file. |
+| Merging folders in Explorer asks you to overwrite or skip each clash. | Skips files that are identical, and keeps both versions of different files, renaming the new one `(gphotos-collision-N)`. Nothing is overwritten. |
+| Repeating all this for each new export. | Imports only exports it hasn't seen, so re-running is safe. It can run on a schedule, and it works with network (SMB) folders. |
+
+<!-- MAINTAINER NOTE: when you add, change or remove a script feature, update this table so it
+     still shows how the script differs from doing the same job by hand. Add a row for a new
+     capability, edit a row if behaviour changes, and update "Limits to be aware of" below if a
+     limitation is lifted or a new one appears, including the "Tested so far" entry when more is
+     tested. -->
+
+**Limits to be aware of:**
+
+- **It can't read your library directly.** Since March 2025, Google's Photos API only lets an app
+  see photos that the app itself uploaded. Takeout is the only practical way to get a whole
+  library, so the script depends on it.
+- **New photos arrive only with a new export.** The script can't see photos added to Google Photos
+  since the last export. Takeout can schedule an export at most every 2 months, so your folder can
+  be up to 2 months behind. You can also create an export by hand at any time.
+- **Each export is a full copy of the library, not just the new photos.** Every new export is
+  downloaded in full (identical files are then skipped when copying). For a large library that
+  means a long download every time.
+- **One-way only (Google to folder).** There's no upload back to Google Photos and no true
+  two-way sync. The script never deletes anything, so a photo you delete in Google Photos stays in
+  your folder.
+- **Not covered:** creating the Takeout export, and deleting old exports from Drive. The script
+  has read-only access to Drive, so it can't remove them. Delete them yourself in Drive's
+  `Takeout` folder.
+- **Drive storage:** the "Add to Drive" delivery option uses your Drive space until you delete the
+  export. Downloading straight from Takeout in a browser doesn't. That's the cost of automating
+  the download.
+- **Only file dates are restored.** Takeout's metadata (descriptions, locations, people, album
+  membership) isn't written into the photos. The `.json` files are discarded unless you set
+  `CopyJsonSidecars`.
+- **Small libraries:** for a few dozen photos, doing it by hand takes about as long, and the
+  one-time Google Cloud setup below is more work than the manual job. The script pays off with big
+  libraries, many archive parts, or repeated exports.
+- **Windows only.** The saved sign-in is encrypted with Windows DPAPI, so the script needs
+  Windows PowerShell 5.1 or PowerShell 7 on Windows.
+- **Tested so far** on a small export (62 photos, one album) plus synthetic test archives, on both
+  PowerShell versions. It hasn't been run on a library of 100 GB or more, on `.tgz` exports, or
+  against a network (SMB) destination.
+
 ## What it does
 
 1. Signs in to Google with **read-only** access to Google Drive. The first time, your browser
@@ -44,15 +95,35 @@ Google requires every app, including a personal script, to have its own client I
 2. Go to **APIs & Services → Library**, search for **Google Drive API** and click **Enable**.
 3. Go to **Google Auth Platform** (older consoles call it "OAuth consent screen"):
    - **Branding:** enter an app name and your email.
-   - **Audience:** choose **External**, then click **Publish app** so the status is
-     **In production**.
-
-     *Why publish:* in "Testing" status, Google expires your sign-in every 7 days. Publishing
-     doesn't make the app public. You'll just see a "Google hasn't verified this app" warning
-     at sign-in. Click **Advanced → Go to (app name)** to continue, since it's your own app.
+   - **Audience:** choose **External**. Then do **one** of these. Without it, sign-in fails with
+     `Error 403: access_denied` ("has not completed the Google verification process").
+     - **Add yourself as a test user (quickest):** under **Test users**, click **Add users**,
+       enter the Google email you'll sign in with, and save. The app stays in **Testing**
+       status, so Google expires your sign-in every 7 days and you have to sign in again.
+     - **Publish the app (recommended):** click **Publish app** so the status is
+       **In production**. Sign-ins then no longer expire after 7 days. Publishing doesn't make
+       the app public or need a review for personal use. You'll just see a "Google hasn't
+       verified this app" warning at sign-in. Click **Advanced → Go to (app name)** to continue,
+       since it's your own app.
 4. Go to **Clients → Create client → Application type: Desktop app**, then click
    **Create → Download JSON**.
-5. Save the downloaded file next to the script as **`client_secret.json`**.
+5. Save the downloaded file in the same folder as the script. The name Google gives it
+   (`client_secret_<numbers>.apps.googleusercontent.com.json`) works as it is, or you can rename
+   it to **`client_secret.json`**. Keep it private: it's excluded from git, so don't commit or
+   share it.
+6. Run `GooglePhotosSync.ps1 -SignIn`. Your browser opens, you sign in with the account from
+   step 3 and approve read-only access to Google Drive, and the script confirms which account it
+   is signed in as.
+
+**If sign-in fails:**
+
+| Message | Cause and fix |
+|---|---|
+| `Error 403: access_denied` ... "can only be accessed by developer-approved testers" | The app is in Testing status and your account isn't a test user. Add it under **Audience → Test users**, or publish the app (step 3). |
+| `Google Drive API has not been used in project ...` | Enable the Drive API (step 2) and wait a minute. |
+| `Google OAuth client file not found` | `client_secret*.json` isn't in the script's folder. Set `ClientSecretFile` in `config.json` if it's elsewhere. |
+| `Several client_secret*.json files found` | Leave only one in the folder, or set `ClientSecretFile`. |
+| Browser doesn't open | Copy the link the script prints into your browser. |
 
 ### 2. Schedule the Takeout export
 
