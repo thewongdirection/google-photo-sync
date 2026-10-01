@@ -220,6 +220,12 @@ function Get-ClientCredentials {
     if ($Config.ClientId -and $Config.ClientSecret) { return @{ Id = $Config.ClientId; Secret = $Config.ClientSecret } }
     $file = $Config.ClientSecretFile
     if (-not (Test-Path -LiteralPath $file)) {
+        # Google's download is named "client_secret_<id>.apps.googleusercontent.com.json"; accept it as-is.
+        $found = @(Get-ChildItem -LiteralPath (Split-Path -Parent $file) -Filter 'client_secret*.json' -File -ErrorAction SilentlyContinue)
+        if ($found.Count -eq 1) { $file = $found[0].FullName }
+        elseif ($found.Count -gt 1) { throw "Several client_secret*.json files found next to $file; set ClientSecretFile in config.json." }
+    }
+    if (-not (Test-Path -LiteralPath $file)) {
         throw "Google OAuth client file not found: $file. Create a Desktop OAuth client in Google Cloud and save its JSON there (see README.md)."
     }
     $j = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
@@ -616,6 +622,7 @@ function Get-ProductFolder($Items) {
     if ($list.Count -le 1) { return $list | Select-Object -First 1 }
     $photos = @($list | Where-Object { $_ -match 'Photo|Foto' })
     if ($photos.Count -eq 1) { return $photos[0] }
+    if ($photos.Count -eq 0) { return $null }   # export has no Google Photos folder
     throw ("Cannot tell which Takeout folder holds Google Photos (found: {0}). Set ProductFolder in config.json." -f ($list -join ', '))
 }
 
