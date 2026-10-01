@@ -41,8 +41,27 @@
 .PARAMETER Reprocess
     Import the selected Drive export(s) again even if they were imported before.
 
+.PARAMETER SignIn
+    Only sign in to Google and save the authorisation (no import). If a saved sign-in still works,
+    shows which account it is for. Combine with -ReAuthenticate to switch accounts.
+
+.PARAMETER SignOut
+    Revoke the saved Google authorisation and delete it from this computer.
+
+.PARAMETER SignOutWhenDone
+    After a Google Drive run finishes, revoke and delete the saved sign-in, so no Google credentials
+    stay on this computer. The next run will ask you to sign in again in the browser.
+    Can also be set permanently with "SignOutWhenDone": true in config.json.
+
+.PARAMETER Unattended
+    Never open a browser. If the saved sign-in is missing or no longer valid, fail immediately
+    (exit code 2) instead of waiting for someone to sign in. Use this for scheduled tasks.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\GooglePhotosSync.ps1
+
+.EXAMPLE
+    .\GooglePhotosSync.ps1 -SignIn
 
 .EXAMPLE
     .\GooglePhotosSync.ps1 -SourcePath D:\Downloads\takeout -Destination \\nas\photos\Google -DryRun
@@ -54,7 +73,11 @@ param(
     [string]$Destination,
     [switch]$DryRun,
     [switch]$ReAuthenticate,
-    [switch]$Reprocess
+    [switch]$Reprocess,
+    [switch]$SignIn,
+    [switch]$SignOut,
+    [switch]$SignOutWhenDone,
+    [switch]$Unattended
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,6 +88,8 @@ if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'config.json' }
 $script:OAuthScope     = 'https://www.googleapis.com/auth/drive.readonly'
 $script:AuthEndpoint   = 'https://accounts.google.com/o/oauth2/v2/auth'
 $script:TokenEndpoint  = 'https://oauth2.googleapis.com/token'
+$script:RevokeEndpoint = 'https://oauth2.googleapis.com/revoke'
+$script:DriveAboutUri  = 'https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)'
 $script:DriveFilesUri  = 'https://www.googleapis.com/drive/v3/files'
 $script:InvalidChars   = [IO.Path]::GetInvalidFileNameChars()
 $script:CopyBuffer     = New-Object byte[] (1MB)
@@ -72,6 +97,8 @@ $script:Stats          = @{ Copied = 0; CollisionRenamed = 0; SkippedIdentical =
 $script:HashCache      = @{}
 $script:Access         = $null
 $script:ForceConsent   = [bool]$ReAuthenticate
+$script:AuthOnly       = [bool]($SignIn -or $SignOut)
+$script:SignOutPending = $false
 $script:LogWriter      = $null
 
 #region Logging and helpers
@@ -133,6 +160,7 @@ function Read-Config {
         SetFileTimes         = $true
         CopyJsonSidecars     = $false
         DeleteStagedArchives = $true
+        SignOutWhenDone      = $false
     }
     if (Test-Path -LiteralPath $ConfigPath) {
         $json = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
@@ -140,17 +168,18 @@ function Read-Config {
             if ($p.Name.StartsWith('_')) { continue }   # "_comment" style keys
             $cfg[$p.Name] = $p.Value
         }
-    } elseif (-not ($SourcePath -and $Destination)) {
+    } elseif (-not ($SourcePath -and $Destination) -and -not $script:AuthOnly) {
         throw "Config file not found: $ConfigPath. Copy config.example.json to config.json and edit it."
     }
     if ($Destination) { $cfg.Destination = $Destination }
-    if ([string]::IsNullOrWhiteSpace($cfg.Destination)) { throw 'No Destination set (config.json or -Destination).' }
+    if ($SignOutWhenDone) { $cfg.SignOutWhenDone = $true }
+    if ([string]::IsNullOrWhiteSpace($cfg.Destination) -and -not $script:AuthOnly) { throw 'No Destination set (config.json or -Destination).' }
     if ($cfg.ExportSelection -notin 'Latest', 'AllUnprocessed') { throw "ExportSelection must be 'Latest' or 'AllUnprocessed'." }
 
     foreach ($k in 'Destination', 'StateDirectory', 'StagingDirectory', 'ClientSecretFile') {
         $cfg[$k] = Resolve-ConfiguredPath $cfg[$k]
     }
-    $cfg.Destination = $cfg.Destination.TrimEnd('\')
+    if ($cfg.Destination) { $cfg.Destination = $cfg.Destination.TrimEnd('\') }
     return [pscustomobject]$cfg
 }
 
@@ -245,6 +274,11 @@ function Wait-OAuthRedirect($Listener, [TimeSpan]$Timeout) {
 }
 
 function Invoke-BrowserConsent($Client) {
+    if ($Unattended -or -not [Environment]::UserInteractive) {
+        throw ('Google sign-in is required but this is an unattended run, so no browser can be opened. ' +
+               'Run "GooglePhotosSync.ps1 -SignIn" once as this Windows user. If this keeps happening every ~7 days, ' +
+               'your OAuth app is still in "Testing" status; publish it (see README).')
+    }
     $verifier = ConvertTo-Base64Url (New-RandomBytes 48)
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $challenge = ConvertTo-Base64Url ($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes($verifier))) } finally { $sha.Dispose() }
@@ -351,8 +385,9 @@ function Invoke-GoogleApi([string]$Uri) {
     $attempt = 0
     while ($true) {
         $attempt++
+        $bearer = Get-AccessToken   # outside the try: sign-in problems must not be retried
         try {
-            return Invoke-RestMethod -Uri $Uri -Headers @{ Authorization = "Bearer $(Get-AccessToken)" }
+            return Invoke-RestMethod -Uri $Uri -Headers @{ Authorization = "Bearer $bearer" }
         } catch {
             $status = Get-HttpStatus $_
             $text = Get-ErrorText $_
@@ -367,6 +402,37 @@ function Invoke-GoogleApi([string]$Uri) {
             throw "Google API request failed ($status): $text"
         }
     }
+}
+
+function Get-SignedInAccount {
+    $about = Invoke-GoogleApi $script:DriveAboutUri
+    $user = $about.user
+    if ($user.displayName) { return '{0} <{1}>' -f $user.displayName, $user.emailAddress }
+    return $user.emailAddress
+}
+
+function Invoke-SignIn {
+    $script:Client = Get-ClientCredentials
+    $account = Get-SignedInAccount
+    Write-Log "Signed in to Google as $account. The sign-in is saved for this Windows user in $(Get-TokenFilePath)."
+}
+
+function Invoke-SignOut {
+    $p = Get-TokenFilePath
+    $refresh = Read-RefreshToken
+    if (-not $refresh) {
+        if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }
+        Write-Log 'No saved Google sign-in on this computer.'
+        return
+    }
+    try {
+        Invoke-RestMethod -Method Post -Uri $script:RevokeEndpoint -Body @{ token = $refresh } | Out-Null
+        Write-Log 'Google access revoked.'
+    } catch {
+        Write-Log "Could not revoke access with Google ($(Get-ErrorText $_)). You can remove it manually at https://myaccount.google.com/permissions" WARN
+    }
+    Remove-Item -LiteralPath $p -Force
+    Write-Log 'Saved Google sign-in deleted from this computer.'
 }
 
 function Get-DriveTakeoutExports {
@@ -429,9 +495,10 @@ function Save-DriveFile($File, [string]$TargetPath) {
         $have = 0L
         if (Test-Path -LiteralPath $part) { $have = (Get-Item -LiteralPath $part).Length }
         if ($expected -gt 0 -and $have -ge $expected) { break }
+        $bearer = Get-AccessToken
         try {
             $req = [Net.HttpWebRequest][Net.WebRequest]::Create($uri)
-            $req.Headers['Authorization'] = "Bearer $(Get-AccessToken)"
+            $req.Headers['Authorization'] = "Bearer $bearer"
             $req.Timeout = 120000
             $req.ReadWriteTimeout = 300000
             if ($have -gt 0) { $req.AddRange($have) }
@@ -895,6 +962,7 @@ function Invoke-LocalImport {
 
 function Invoke-DriveImport {
     $script:Client = Get-ClientCredentials
+    Write-Log "Signed in to Google as $(Get-SignedInAccount)."
     Write-Log 'Looking for Google Takeout archives in Google Drive...'
     $exports = @(Get-DriveTakeoutExports)
     if ($exports.Count -eq 0) {
@@ -971,6 +1039,10 @@ try {
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
+    if ($SignIn -and $SignOut) { throw 'Use either -SignIn or -SignOut, not both.' }
+    if ($SignOut) { Invoke-SignOut; exit 0 }
+    if ($SignIn) { Invoke-SignIn; exit 0 }
+
     $mode = 'Google Drive'
     if ($SourcePath) { $mode = 'local files' }
     $dry = ''
@@ -982,7 +1054,15 @@ try {
     Import-HashCache
     $started = $true
 
-    if ($SourcePath) { Invoke-LocalImport } else { Invoke-DriveImport }
+    if ($SourcePath) {
+        Invoke-LocalImport
+    } else {
+        if ($Config.SignOutWhenDone -and $Unattended) {
+            Write-Log 'SignOutWhenDone is on, so the next unattended run will not be able to sign in. Run with -SignIn before it.' WARN
+        }
+        $script:SignOutPending = [bool]$Config.SignOutWhenDone
+        Invoke-DriveImport
+    }
 } catch {
     $exitCode = 2
     Write-Log $_.Exception.Message ERROR
@@ -993,6 +1073,11 @@ try {
         $s = $script:Stats
         Write-Log ('Summary: {0} copied, {1} kept both (renamed), {2} already present, {3} errors. File dates set: {4}, no date found: {5}.' -f `
                 $s.Copied, $s.CollisionRenamed, $s.SkippedIdentical, $s.Errors, $s.TimesSet, $s.TimesMissing)
+    }
+    if ($script:SignOutPending) {
+        # Runs even if the import failed part-way, so credentials never stay behind when this option is on.
+        try { Write-Log 'SignOutWhenDone: signing out of Google...'; Invoke-SignOut }
+        catch { Write-Log "Sign-out failed: $($_.Exception.Message)" ERROR }
     }
     if ($script:LogWriter) { $script:LogWriter.Dispose() }
 }

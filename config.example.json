@@ -13,5 +13,6 @@
     "CollisionTag": "gphotos-collision",
     "SetFileTimes": true,
     "CopyJsonSidecars": false,
-    "DeleteStagedArchives": true
+    "DeleteStagedArchives": true,
+    "SignOutWhenDone": false
 }

@@ -85,6 +85,7 @@ JSON: `"\\\\nas\\photos\\Google Photos"` means `\\nas\photos\Google Photos`.
 | `SetFileTimes` | `true` | Set file dates to when the photo was taken. |
 | `CopyJsonSidecars` | `false` | Also copy Takeout's `.json` metadata files. |
 | `DeleteStagedArchives` | `true` | Delete each downloaded part once it has been imported without errors. |
+| `SignOutWhenDone` | `false` | Sign out of Google after every Drive run (see [Your Google sign-in](#your-google-sign-in)). |
 
 ## Running it
 
@@ -98,19 +99,44 @@ Useful options:
 - `-SourcePath <path>` imports Takeout archives you already downloaded (a `.zip`/`.tgz`, a folder
   of them, or an extracted `Takeout` folder). No Google sign-in is needed.
 - `-Destination <path>` overrides the config.
-- `-ReAuthenticate` signs in to Google again.
+- `-SignIn` / `-SignOut` / `-SignOutWhenDone` / `-Unattended` manage the saved Google sign-in
+  (see below).
+- `-ReAuthenticate` signs in to Google again, for example to switch accounts.
 - `-Reprocess` imports an export again even if it was already imported.
 - `-Verbose` shows every copied file. Every file is always recorded in the log.
 
 Exit codes: `0` means OK, `1` means some files failed (see the log), `2` means a fatal error.
 
+### Your Google sign-in
+
+By default the script **keeps you signed in**. After you approve access in the browser once, it
+saves Google's long-lived authorisation, encrypted with Windows DPAPI so only your Windows user on
+this computer can use it. Later runs reuse it without opening a browser, and each run logs which
+Google account it's using.
+
+| Command | What it does |
+|---|---|
+| `-SignIn` | Signs in and saves the authorisation without importing anything. If you're already signed in, it just shows the account. Do this once before scheduling. |
+| `-SignIn -ReAuthenticate` | Signs in again, for example with a different Google account. |
+| `-SignOut` | Revokes the script's access at Google and deletes the saved authorisation. |
+| `-SignOutWhenDone` | Runs the backup, then signs out, even if the run failed part-way, so no credentials stay on the PC. The next run asks you to sign in again. To make this permanent, set `"SignOutWhenDone": true` in `config.json`. |
+| `-Unattended` | Never opens a browser. If the saved sign-in is missing or has expired, the run stops immediately with exit code 2, instead of waiting for someone to sign in. |
+
+The saved sign-in lasts until you sign out or revoke access at
+<https://myaccount.google.com/permissions>. The exception is an OAuth app left in **Testing**
+status, whose sign-ins expire after 7 days. See setup step 1.
+
+`SignOutWhenDone` and scheduled `-Unattended` runs don't mix: once the script signs out, the next
+unattended run can't sign back in. Use `SignOutWhenDone` for manual runs.
+
 ### Running on a schedule
 
-In Task Scheduler, create a task that runs **as your user**. It has to be your user because the
-saved Google sign-in is encrypted for that Windows user.
+1. Run `GooglePhotosSync.ps1 -SignIn` once, by hand.
+2. In Task Scheduler, create a task that runs **as the same Windows user**. It has to be the same
+   user because the saved Google sign-in is encrypted for that user.
 
 - **Program:** `powershell.exe`
-- **Arguments:** `-NoProfile -ExecutionPolicy Bypass -File "D:\path\to\GooglePhotosSync.ps1"`
+- **Arguments:** `-NoProfile -ExecutionPolicy Bypass -File "D:\path\to\GooglePhotosSync.ps1" -Unattended`
 - **Trigger:** weekly is plenty, since Takeout exports arrive every 2 months.
 
 ### Network (SMB) destinations
@@ -129,5 +155,5 @@ different login, open the share once in Explorer and tick "Remember my credentia
 - **EXIF isn't modified.** Only the file's created and modified dates are set.
 - **Very long paths** (over 260 characters) can fail on Windows PowerShell 5.1. Failures are
   logged, and the run continues.
-- The saved Google sign-in is encrypted with Windows DPAPI in `StateDirectory\refresh-token.dat`.
-  To revoke access, go to <https://myaccount.google.com/permissions>.
+- The saved Google sign-in is stored in `StateDirectory\refresh-token.dat`. It can't be copied to
+  another PC or Windows user; sign in there separately.
