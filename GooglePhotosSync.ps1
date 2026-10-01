@@ -30,10 +30,27 @@
     archives, a folder containing them, or an extracted "Takeout" folder. No Google sign-in needed.
 
 .PARAMETER Destination
-    Overrides Destination from the config file.
+    The folder to unzip the photos into (alias: -ExtractTo). Defaults to a folder named "Takeout" in
+    the current directory. A relative path is relative to the current directory. Overrides
+    Destination in the config file. Can be a network (UNC) path.
+
+.PARAMETER Review
+    Only report how many photos and videos the export(s) contain and how much disk space the
+    download and the unzipped files need (alias: -Estimate). Downloads and writes nothing: for
+    Google Drive exports it reads just the table of contents of each archive.
+
+.PARAMETER DownloadOnly
+    Download the archives from Google Drive and stop: nothing is unzipped or copied to the
+    destination, and the export is not marked as imported. The archives are kept in the staging
+    folder (see -StagingDirectory); unzip them later with -SourcePath. Off by default. Can also be
+    set with "DownloadOnly": true in config.json.
+
+.PARAMETER StagingDirectory
+    Folder the archives are downloaded to. Overrides StagingDirectory in the config file.
 
 .PARAMETER DryRun
-    Report what would be copied without writing anything to the destination.
+    Report what would be copied without writing anything to the destination. Archives are still
+    downloaded; use -Review to avoid that.
 
 .PARAMETER ReAuthenticate
     Ignore the saved Google authorisation and sign in again.
@@ -64,13 +81,27 @@
     .\GooglePhotosSync.ps1 -SignIn
 
 .EXAMPLE
+    .\GooglePhotosSync.ps1 -Review
+
+.EXAMPLE
+    .\GooglePhotosSync.ps1 -ExtractTo D:\Photos\Google
+
+.EXAMPLE
+    .\GooglePhotosSync.ps1 -DownloadOnly -StagingDirectory D:\TakeoutZips
+
+.EXAMPLE
     .\GooglePhotosSync.ps1 -SourcePath D:\Downloads\takeout -Destination \\nas\photos\Google -DryRun
 #>
 [CmdletBinding()]
 param(
     [string]$ConfigPath,
     [string[]]$SourcePath,
+    [Alias('ExtractTo')]
     [string]$Destination,
+    [string]$StagingDirectory,
+    [Alias('Estimate')]
+    [switch]$Review,
+    [switch]$DownloadOnly,
     [switch]$DryRun,
     [switch]$ReAuthenticate,
     [switch]$Reprocess,
@@ -97,8 +128,12 @@ $script:Stats          = @{ Copied = 0; CollisionRenamed = 0; SkippedIdentical =
 $script:HashCache      = @{}
 $script:Access         = $null
 $script:ForceConsent   = [bool]$ReAuthenticate
-$script:AuthOnly       = [bool]($SignIn -or $SignOut)
 $script:SignOutPending = $false
+$script:ImpTracker     = $null   # progress for the archive currently being unzipped
+$script:ImpBase        = 0L
+$script:Downloaded     = @{ Parts = 0; Bytes = 0L }
+$script:U32Max         = [long]4294967295
+try { $script:ConsoleRedirected = [Console]::IsOutputRedirected } catch { $script:ConsoleRedirected = $true }
 $script:LogWriter      = $null
 
 #region Logging and helpers
@@ -139,7 +174,60 @@ function Resolve-ConfiguredPath([string]$Path) {
     return [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $expanded))
 }
 
-function Format-GB([long]$Bytes) { '{0:N2} GB' -f ($Bytes / 1GB) }
+function Format-GB([long]$Bytes) {
+    if ($Bytes -ge 1GB) { return '{0:N2} GB' -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return '{0:N1} MB' -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return '{0:N0} KB' -f ($Bytes / 1KB) }
+    return "$Bytes bytes"
+}
+
+# Relative paths given on the command line are relative to the current directory.
+function Resolve-CurrentDirPath([string]$Path) {
+    $expanded = [Environment]::ExpandEnvironmentVariables($Path)
+    return [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).ProviderPath, $expanded))
+}
+
+#endregion
+
+#region Progress bars
+
+# Interactive console: a Write-Progress bar with speed and time left.
+# Output redirected (scheduled task, log capture): a log line every 10% instead.
+function New-ProgressTracker([string]$Activity, [long]$Total, [long]$Start = 0, [int]$Id = 1) {
+    return @{ Activity = $Activity; Total = $Total; Start = $Start; Id = $Id; Watch = [Diagnostics.Stopwatch]::StartNew(); LastTick = -1000L; LastDecile = 0 }
+}
+
+function Update-ProgressTracker($T, [long]$Done) {
+    $pct = 0
+    if ($T.Total -gt 0) { $pct = [int][Math]::Min(100, [Math]::Floor($Done * 100 / $T.Total)) }
+    $ms = $T.Watch.ElapsedMilliseconds
+    if ($script:ConsoleRedirected) {
+        $decile = [int][Math]::Floor($pct / 10)
+        if ($decile -gt $T.LastDecile) {
+            $T.LastDecile = $decile
+            Write-Log ('{0}: {1}% ({2} of {3})' -f $T.Activity, $pct, (Format-GB $Done), (Format-GB $T.Total))
+        }
+        return
+    }
+    if ($ms - $T.LastTick -lt 250) { return }
+    $T.LastTick = $ms
+    $status = '{0} of {1} ({2}%)' -f (Format-GB $Done), (Format-GB $T.Total), $pct
+    $moved = $Done - $T.Start
+    if ($ms -gt 2000 -and $moved -gt 0) {
+        $rate = $moved / ($ms / 1000.0)
+        $status += ' - {0}/s' -f (Format-GB ([long]$rate))
+        if ($T.Total -gt $Done) { $status += ', about {0} left' -f [TimeSpan]::FromSeconds([Math]::Min(359999, ($T.Total - $Done) / $rate)).ToString('hh\:mm\:ss') }
+    }
+    Write-Progress -Id $T.Id -Activity $T.Activity -Status $status -PercentComplete $pct
+}
+
+function Complete-ProgressTracker($T) {
+    if ($script:ConsoleRedirected) {
+        if ($T.LastDecile -lt 10 -and $T.Total -gt 0) { Write-Log ('{0}: 100% ({1})' -f $T.Activity, (Format-GB $T.Total)) }
+        return
+    }
+    Write-Progress -Id $T.Id -Activity $T.Activity -Completed
+}
 
 #endregion
 
@@ -161,25 +249,29 @@ function Read-Config {
         CopyJsonSidecars     = $false
         DeleteStagedArchives = $true
         SignOutWhenDone      = $false
+        DownloadOnly         = $false
     }
+    # The config file is optional: without one the defaults apply (and -Destination can be given).
     if (Test-Path -LiteralPath $ConfigPath) {
         $json = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
         foreach ($p in $json.PSObject.Properties) {
             if ($p.Name.StartsWith('_')) { continue }   # "_comment" style keys
             $cfg[$p.Name] = $p.Value
         }
-    } elseif (-not ($SourcePath -and $Destination) -and -not $script:AuthOnly) {
-        throw "Config file not found: $ConfigPath. Copy config.example.json to config.json and edit it."
     }
-    if ($Destination) { $cfg.Destination = $Destination }
     if ($SignOutWhenDone) { $cfg.SignOutWhenDone = $true }
-    if ([string]::IsNullOrWhiteSpace($cfg.Destination) -and -not $script:AuthOnly) { throw 'No Destination set (config.json or -Destination).' }
+    if ($DownloadOnly) { $cfg.DownloadOnly = $true }
     if ($cfg.ExportSelection -notin 'Latest', 'AllUnprocessed') { throw "ExportSelection must be 'Latest' or 'AllUnprocessed'." }
 
+    # Paths in the config file are relative to the script; paths from the command line are
+    # relative to the current directory. With neither, unzip into .\Takeout in the current directory.
     foreach ($k in 'Destination', 'StateDirectory', 'StagingDirectory', 'ClientSecretFile') {
         $cfg[$k] = Resolve-ConfiguredPath $cfg[$k]
     }
-    if ($cfg.Destination) { $cfg.Destination = $cfg.Destination.TrimEnd('\') }
+    if ($Destination) { $cfg.Destination = Resolve-CurrentDirPath $Destination }
+    elseif ([string]::IsNullOrWhiteSpace($cfg.Destination)) { $cfg.Destination = Join-Path (Get-Location).ProviderPath 'Takeout' }
+    if ($StagingDirectory) { $cfg.StagingDirectory = Resolve-CurrentDirPath $StagingDirectory }
+    if ($cfg.Destination.Length -gt 3) { $cfg.Destination = $cfg.Destination.TrimEnd('\') }
     return [pscustomobject]$cfg
 }
 
@@ -474,21 +566,16 @@ function Get-DriveTakeoutExports {
 
 function Copy-StreamWithProgress($In, $Out, [long]$Done, [long]$Total, [string]$Activity) {
     $buf = $script:CopyBuffer
-    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $t = New-ProgressTracker $Activity $Total $Done 1
     while (($n = $In.Read($buf, 0, $buf.Length)) -gt 0) {
         $Out.Write($buf, 0, $n)
         $Done += $n
-        if ($sw.ElapsedMilliseconds -ge 1000) {
-            $sw.Restart()
-            $pct = 0
-            if ($Total -gt 0) { $pct = [int][Math]::Min(100, $Done * 100 / $Total) }
-            Write-Progress -Activity $Activity -Status ('{0:N0} of {1:N0} MB' -f ($Done / 1MB), ($Total / 1MB)) -PercentComplete $pct
-        }
+        Update-ProgressTracker $t $Done
     }
-    Write-Progress -Activity $Activity -Completed
+    Complete-ProgressTracker $t
 }
 
-function Save-DriveFile($File, [string]$TargetPath) {
+function Save-DriveFile($File, [string]$TargetPath, [string]$Label = '') {
     $expected = [long]$File.size
     if (Test-Path -LiteralPath $TargetPath) {
         if ((Get-Item -LiteralPath $TargetPath).Length -eq $expected) { Write-Log "Already downloaded: $($File.name)"; return }
@@ -515,7 +602,7 @@ function Save-DriveFile($File, [string]$TargetPath) {
                 if ($append) { $mode = [IO.FileMode]::Append } else { $have = 0 }
                 $in = $resp.GetResponseStream()
                 $out = [IO.File]::Open($part, $mode, [IO.FileAccess]::Write)
-                try { Copy-StreamWithProgress $in $out $have $expected "Downloading $($File.name)" }
+                try { Copy-StreamWithProgress $in $out $have $expected "Downloading $($File.name)$Label" }
                 finally { $out.Dispose(); $in.Dispose() }
             } finally { $resp.Close() }
             if ($expected -le 0) { break }
@@ -543,11 +630,226 @@ function Save-DriveFile($File, [string]$TargetPath) {
     Move-Item -LiteralPath $part -Destination $TargetPath -Force
 }
 
+# Free bytes on the volume holding $Path (works for network shares too), or $null if unknown.
+# $Path may not exist yet; the nearest existing parent folder is used.
+function Get-FreeSpace([string]$Path) {
+    $p = $Path
+    while ($p -and -not (Test-Path -LiteralPath $p)) { $p = Split-Path -Parent $p }
+    if (-not $p) { return $null }
+    try {
+        if (-not ('GooglePhotosSync.Native' -as [type])) {
+            Add-Type -Namespace GooglePhotosSync -Name Native -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)] public static extern bool GetDiskFreeSpaceEx(string dir, out ulong avail, out ulong total, out ulong free);'
+        }
+        [uint64]$avail = 0; [uint64]$total = 0; [uint64]$free = 0
+        if ([GooglePhotosSync.Native]::GetDiskFreeSpaceEx($p, [ref]$avail, [ref]$total, [ref]$free)) { return [long]$avail }
+    } catch { }
+    return $null
+}
+
 function Assert-FreeSpace([string]$Directory, [long]$Needed) {
-    $drive = New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($Directory))
-    if ($drive.AvailableFreeSpace -lt $Needed + 1GB) {
-        throw ('Not enough free space in {0}: need {1}, have {2}. Change StagingDirectory in config.json or free up space.' -f $Directory, (Format-GB $Needed), (Format-GB $drive.AvailableFreeSpace))
+    $free = Get-FreeSpace $Directory
+    if ($null -ne $free -and $free -lt $Needed + 1GB) {
+        throw ('Not enough free space in {0}: need {1}, have {2}. Change StagingDirectory in config.json or free up space.' -f $Directory, (Format-GB $Needed), (Format-GB $free))
     }
+}
+
+#endregion
+
+#region Review: how many photos and how much disk space
+
+$script:MediaKind = @{}
+foreach ($e in 'jpg', 'jpeg', 'jfif', 'png', 'gif', 'heic', 'heif', 'webp', 'avif', 'tif', 'tiff', 'bmp', 'dng', 'raw', 'cr2', 'cr3', 'nef', 'arw', 'orf', 'rw2') { $script:MediaKind[".$e"] = 'Photos' }
+foreach ($e in 'mp4', 'mov', 'avi', 'mkv', 'm4v', '3gp', 'wmv', 'mpg', 'mpeg', 'webm', 'mts', 'm2ts') { $script:MediaKind[".$e"] = 'Videos' }
+
+# Reads $From..$To (inclusive) of a Drive file without downloading the rest of it.
+function Read-DriveRange($File, [long]$From, [long]$To) {
+    $uri = '{0}/{1}?alt=media' -f $script:DriveFilesUri, $File.id
+    $failures = 0
+    while ($true) {
+        $bearer = Get-AccessToken
+        try {
+            $req = [Net.HttpWebRequest][Net.WebRequest]::Create($uri)
+            $req.Headers['Authorization'] = "Bearer $bearer"
+            $req.Timeout = 120000
+            $req.ReadWriteTimeout = 300000
+            $req.AddRange($From, $To)
+            $resp = $req.GetResponse()
+            try {
+                if ([int]$resp.StatusCode -ne 206) { throw 'Google Drive did not honour the byte-range request.' }
+                $ms = New-Object IO.MemoryStream
+                $s = $resp.GetResponseStream()
+                try { $s.CopyTo($ms) } finally { $s.Dispose() }
+                return , $ms.ToArray()
+            } finally { $resp.Close() }
+        } catch {
+            $failures++
+            if ((Get-HttpStatus $_) -eq 401) { $script:Access = $null }
+            if ($failures -ge 5 -or $_.Exception.Message -like '*did not honour*') { throw }
+            Start-Sleep -Seconds ([Math]::Pow(2, $failures))
+        }
+    }
+}
+
+# Lists the files in a zip (path and unzipped size) from its table of contents, which sits at the end
+# of the archive. $ReadRange is called as ($from, $to) and returns those bytes. Handles zip64.
+function Read-ZipCentralDirectory([scriptblock]$ReadRange, [long]$Size) {
+    $tailLen = [Math]::Min($Size, 131072L)
+    [byte[]]$tail = & $ReadRange ($Size - $tailLen) ($Size - 1)
+    $eocd = -1
+    for ($i = $tail.Length - 22; $i -ge 0; $i--) {
+        if ($tail[$i] -eq 0x50 -and $tail[$i + 1] -eq 0x4B -and $tail[$i + 2] -eq 5 -and $tail[$i + 3] -eq 6) { $eocd = $i; break }
+    }
+    if ($eocd -lt 0) { throw 'Not a zip archive (no end-of-directory record found).' }
+    $total = [long][BitConverter]::ToUInt16($tail, $eocd + 10)
+    $cdSize = [long][BitConverter]::ToUInt32($tail, $eocd + 12)
+    $cdOffset = [long][BitConverter]::ToUInt32($tail, $eocd + 16)
+    if ($total -eq 65535 -or $cdSize -eq $script:U32Max -or $cdOffset -eq $script:U32Max) {
+        $loc = $eocd - 20
+        if ($loc -lt 0 -or $tail[$loc] -ne 0x50 -or $tail[$loc + 1] -ne 0x4B -or $tail[$loc + 2] -ne 6 -or $tail[$loc + 3] -ne 7) {
+            throw 'Zip64 end-of-directory locator not found.'
+        }
+        $recOffset = [long][BitConverter]::ToUInt64($tail, $loc + 8)
+        [byte[]]$rec = & $ReadRange $recOffset ($recOffset + 55)
+        if ($rec.Length -lt 56 -or $rec[2] -ne 6 -or $rec[3] -ne 6) { throw 'Zip64 end-of-directory record not found.' }
+        $total = [long][BitConverter]::ToUInt64($rec, 32)
+        $cdSize = [long][BitConverter]::ToUInt64($rec, 40)
+        $cdOffset = [long][BitConverter]::ToUInt64($rec, 48)
+    }
+    if ($cdSize -gt 1GB) { throw 'Zip table of contents is unexpectedly large.' }
+    [byte[]]$cd = @()
+    if ($cdSize -gt 0) { $cd = & $ReadRange $cdOffset ($cdOffset + $cdSize - 1) }
+
+    $entries = New-Object Collections.Generic.List[object]
+    $utf8 = [Text.Encoding]::UTF8
+    $p = 0
+    for ($n = 0; $n -lt $total -and $p + 46 -le $cd.Length; $n++) {
+        if ($cd[$p] -ne 0x50 -or $cd[$p + 1] -ne 0x4B -or $cd[$p + 2] -ne 1 -or $cd[$p + 3] -ne 2) { throw 'Corrupt zip table of contents.' }
+        $comp = [long][BitConverter]::ToUInt32($cd, $p + 20)
+        $uncomp = [long][BitConverter]::ToUInt32($cd, $p + 24)
+        $nameLen = [int][BitConverter]::ToUInt16($cd, $p + 28)
+        $extraLen = [int][BitConverter]::ToUInt16($cd, $p + 30)
+        $commentLen = [int][BitConverter]::ToUInt16($cd, $p + 32)
+        $localOffset = [long][BitConverter]::ToUInt32($cd, $p + 42)
+        $name = $utf8.GetString($cd, $p + 46, $nameLen)
+        if ($uncomp -eq $script:U32Max -or $comp -eq $script:U32Max -or $localOffset -eq $script:U32Max) {
+            $e = $p + 46 + $nameLen
+            $end = $e + $extraLen
+            while ($e + 4 -le $end) {
+                $id = [BitConverter]::ToUInt16($cd, $e)
+                $len = [int][BitConverter]::ToUInt16($cd, $e + 2)
+                if ($id -eq 1) {   # zip64 extra field: only the fields that were 0xFFFFFFFF, in this order
+                    $q = $e + 4
+                    if ($uncomp -eq $script:U32Max) { $uncomp = [long][BitConverter]::ToUInt64($cd, $q); $q += 8 }
+                    break
+                }
+                $e += 4 + $len
+            }
+        }
+        if (-not $name.EndsWith('/')) { $entries.Add([pscustomobject]@{ Path = $name.Replace('\', '/'); Length = $uncomp }) }
+        $p += 46 + $nameLen + $extraLen + $commentLen
+    }
+    return , $entries
+}
+
+function Get-RemoteZipEntries($File) {
+    $reader = { param($From, $To) Read-DriveRange $File $From $To }.GetNewClosure()
+    return Read-ZipCentralDirectory $reader ([long]$File.size)
+}
+
+function New-ReviewAccumulator {
+    return @{ Files = 0; Photos = 0; Videos = 0; Other = 0; Bytes = 0L; Seen = @{}; UniqueFiles = 0; Problems = (New-Object Collections.Generic.List[string]) }
+}
+
+# Counts the files from one archive part that the import would copy.
+function Add-ReviewItems($Acc, $Items, [string]$PartName) {
+    try { $product = Get-ProductFolder $Items } catch { $Acc.Problems.Add("${PartName}: $($_.Exception.Message)"); return }
+    if (-not $product) { return }
+    foreach ($it in $Items) {
+        $rel = Get-MirrorPath $it.Path $product
+        if (-not $rel) { continue }
+        if ($rel.EndsWith('.json', [StringComparison]::OrdinalIgnoreCase) -and -not $Config.CopyJsonSidecars) { continue }
+        $kind = $script:MediaKind[[IO.Path]::GetExtension($rel).ToLowerInvariant()]
+        if (-not $kind) { $kind = 'Other' }
+        $Acc[$kind]++
+        $Acc.Files++
+        $Acc.Bytes += $it.Length
+        $key = $rel.Substring($rel.LastIndexOf('\') + 1).ToLowerInvariant() + '|' + $it.Length
+        if (-not $Acc.Seen.ContainsKey($key)) { $Acc.Seen[$key] = $true; $Acc.UniqueFiles++ }
+    }
+}
+
+function Write-Report([string]$Text = '') {
+    Write-Host $Text
+    if ($script:LogWriter) { $script:LogWriter.WriteLine($Text) }
+}
+
+function Get-VolumeKey([string]$Path) { return [IO.Path]::GetPathRoot($Path).ToUpperInvariant() }
+
+function Write-SpaceLine([string]$Label, [string]$Path, [long]$Needed, $Free) {
+    $verdict = 'free space unknown'
+    $freeText = '?'
+    if ($null -ne $Free) {
+        $freeText = Format-GB $Free
+        if ($Free -ge $Needed) { $verdict = 'enough' } else { $verdict = 'NOT ENOUGH' }
+    }
+    Write-Report ('  {0,-14} {1,10} needed, {2,10} free  [{3}]  {4}' -f $Label, (Format-GB $Needed), $freeText, $verdict, $Path)
+}
+
+function Show-ReviewReport($Reviews) {
+    $stagingNeed = 0L
+    $destNeed = 0L
+    $downloadTotal = 0L
+    $partSizes = New-Object Collections.Generic.List[long]
+    Write-Report
+    Write-Report 'Review of the Takeout export(s)'
+    Write-Report '-------------------------------'
+    foreach ($r in $Reviews) {
+        $a = $r.Acc
+        Write-Report ('{0}' -f $r.Name)
+        if ($r.PartSizes.Count -gt 0) {
+            $size = [long](($r.PartSizes | Measure-Object -Sum).Sum)
+            $downloadTotal += $size
+            foreach ($s in $r.PartSizes) { $partSizes.Add([long]$s) }
+            Write-Report ('  Archive parts : {0} ({1} to download)' -f $r.PartSizes.Count, (Format-GB $size))
+        }
+        Write-Report ('  Files         : {0:N0} ({1:N0} photos, {2:N0} videos, {3:N0} other), {4} once unzipped' -f $a.Files, $a.Photos, $a.Videos, $a.Other, (Format-GB $a.Bytes))
+        Write-Report ('  Unique files  : about {0:N0} (a photo that is also in an album is counted once)' -f $a.UniqueFiles)
+        foreach ($problem in $a.Problems) { Write-Report "  Note          : $problem" }
+        if ($a.Bytes -gt $destNeed) { $destNeed = $a.Bytes }
+    }
+
+    if ($Config.DownloadOnly -or -not $Config.DeleteStagedArchives) { $stagingNeed = $downloadTotal }
+    elseif ($partSizes.Count -gt 0) { $stagingNeed = [long](($partSizes | Measure-Object -Maximum).Maximum) }
+    if ($Config.DownloadOnly) { $destNeed = 0L }
+
+    Write-Report
+    Write-Report 'Disk space needed'
+    $stagingFree = Get-FreeSpace $Config.StagingDirectory
+    $destFree = Get-FreeSpace $Config.Destination
+    $sameVolume = (Get-VolumeKey $Config.StagingDirectory) -eq (Get-VolumeKey $Config.Destination)
+    if ($stagingNeed -gt 0) {
+        $need = $stagingNeed
+        if ($sameVolume) { $need += $destNeed }
+        Write-SpaceLine 'Downloads' $Config.StagingDirectory $need $stagingFree
+    }
+    if ($destNeed -gt 0 -and -not ($stagingNeed -gt 0 -and $sameVolume)) {
+        Write-SpaceLine 'Unzipped files' $Config.Destination $destNeed $destFree
+    } elseif ($destNeed -gt 0) {
+        Write-Report ('  Unzipped files: {0}, on the same drive as the downloads (counted above)  {1}' -f (Format-GB $destNeed), $Config.Destination)
+    }
+    if ($stagingNeed -le 0 -and $destNeed -le 0) { Write-Report '  Nothing to download or unzip.' }
+    Write-Report
+    if ($stagingNeed -gt 0) {
+        if ($Config.DownloadOnly) { Write-Report '  Note on downloads: with -DownloadOnly every archive is kept, so all parts are counted.' }
+        elseif ($Config.DeleteStagedArchives) { Write-Report '  Note on downloads: one part at a time; each is deleted once it has been unzipped, so the largest part is counted.' }
+        else { Write-Report '  Note on downloads: archives are kept (DeleteStagedArchives is off), so all parts are counted.' }
+    }
+    if ($destNeed -gt 0) {
+        Write-Report '  Note on unzipped files: every file is copied, including the album copies Takeout makes of photos. Files already'
+        Write-Report '  in the destination (identical content) are skipped, so a repeat import needs less. If you import several'
+        Write-Report '  different exports, the space needed can grow up to the sum of their sizes.'
+    }
+    Write-Report
 }
 
 #endregion
@@ -787,9 +1089,12 @@ function Write-ImportedFile($Item, [string]$Path) {
             $sha = [Security.Cryptography.SHA256]::Create()
             try {
                 $buf = $script:CopyBuffer
+                $written = 0L
                 while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
                     $out.Write($buf, 0, $n)
                     [void]$sha.TransformBlock($buf, 0, $n, $null, 0)
+                    $written += $n
+                    if ($script:ImpTracker) { Update-ProgressTracker $script:ImpTracker ($script:ImpBase + $written) }
                 }
                 [void]$sha.TransformFinalBlock($buf, 0, 0)
                 $hash = [BitConverter]::ToString($sha.Hash).Replace('-', '')
@@ -896,11 +1201,11 @@ function Import-TakeoutPart([string]$Path, $Pending) {
         }
         Write-Log ("{0}: {1} files from '{2}'" -f $partName, $work.Count, $product)
 
-        $activity = "Importing $partName"
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        $i = 0
+        $totalBytes = 0L
+        foreach ($w in $work) { $totalBytes += $w[0].Length }
+        $script:ImpBase = 0L
+        $script:ImpTracker = New-ProgressTracker "Unzipping $partName" $totalBytes 0 2
         foreach ($w in $work) {
-            $i++
             $rel = $w[1]
             try {
                 $r = Import-MediaItem $w[0] $rel $Pending
@@ -913,13 +1218,12 @@ function Import-TakeoutPart([string]$Path, $Pending) {
                 $script:Stats.Errors++
                 Write-Log "Failed to import $rel : $($_.Exception.Message)" ERROR
             }
-            if ($sw.ElapsedMilliseconds -ge 1000) {
-                $sw.Restart()
-                Write-Progress -Activity $activity -Status "$i of $($work.Count)  ($rel)" -PercentComplete ([int]($i * 100 / $work.Count))
-            }
+            $script:ImpBase += $w[0].Length
+            Update-ProgressTracker $script:ImpTracker $script:ImpBase
         }
-        Write-Progress -Activity $activity -Completed
+        Complete-ProgressTracker $script:ImpTracker
     } finally {
+        $script:ImpTracker = $null
         Close-TakeoutSource $src
     }
 }
@@ -967,19 +1271,19 @@ function Invoke-LocalImport {
     Complete-PendingTimes $pending
 }
 
-function Invoke-DriveImport {
+# Signs in, lists the Takeout exports in Drive and returns the ones this run should handle.
+function Get-ExportsToProcess($State) {
     $script:Client = Get-ClientCredentials
     Write-Log "Signed in to Google as $(Get-SignedInAccount)."
     Write-Log 'Looking for Google Takeout archives in Google Drive...'
     $exports = @(Get-DriveTakeoutExports)
     if ($exports.Count -eq 0) {
         Write-Log 'No Takeout archives (takeout-*.zip / .tgz) found in Google Drive. Create a Google Photos export with delivery "Add to Drive" - see README.md.' WARN
-        return
+        return @()
     }
-    $state = Read-State
     foreach ($e in $exports) {
         $note = ''
-        if ($state.ProcessedExports.ContainsKey($e.Id)) { $note = ' (already imported)' }
+        if ($State.ProcessedExports.ContainsKey($e.Id)) { $note = ' (already imported)' }
         Write-Log ('Found export {0}: {1} part(s), {2}{3}' -f $e.Id, $e.Files.Count, (Format-GB $e.Size), $note)
     }
 
@@ -988,12 +1292,48 @@ function Invoke-DriveImport {
     } else {
         $toDo = @($exports)
     }
-    if (-not $Reprocess) { $toDo = @($toDo | Where-Object { -not $state.ProcessedExports.ContainsKey($_.Id) }) }
-    if ($toDo.Count -eq 0) { Write-Log 'Nothing new to import. (Use -Reprocess to import again.)'; return }
+    if (-not $Reprocess) { $toDo = @($toDo | Where-Object { -not $State.ProcessedExports.ContainsKey($_.Id) }) }
+    if ($toDo.Count -eq 0) { Write-Log 'Nothing new to import. (Use -Reprocess to include exports that were already imported.)' }
+    return $toDo
+}
+
+function Invoke-LocalReview {
+    $acc = New-ReviewAccumulator
+    foreach ($p in @(Expand-SourcePaths $SourcePath)) {
+        $name = [IO.Path]::GetFileName($p.TrimEnd('\'))
+        if ($p -match '\.(tgz|tar\.gz)$') { $acc.Problems.Add("$name is a .tgz archive, which can't be reviewed without unpacking it; it was left out."); continue }
+        Write-Log "Reading the contents of $name..."
+        $src = Open-TakeoutSource $p
+        try { Add-ReviewItems $acc $src.Items $name } finally { Close-TakeoutSource $src }
+    }
+    Show-ReviewReport @([pscustomobject]@{ Name = 'Local files'; Acc = $acc; PartSizes = @() })
+}
+
+function Invoke-DriveReview {
+    $toDo = @(Get-ExportsToProcess (Read-State))
+    if ($toDo.Count -eq 0) { return }
+    $reviews = foreach ($export in $toDo) {
+        $acc = New-ReviewAccumulator
+        $n = 0
+        foreach ($file in $export.Files) {
+            $n++
+            if ($file.name -match '\.(tgz|tar\.gz)$') { $acc.Problems.Add("$($file.name) is a .tgz archive, which can't be reviewed without downloading it; it was left out."); continue }
+            Write-Log ('[{0}/{1}] Reading the contents of {2} ({3}) without downloading it...' -f $n, $export.Files.Count, $file.name, (Format-GB ([long]$file.size)))
+            Add-ReviewItems $acc (Get-RemoteZipEntries $file) $file.name
+        }
+        [pscustomobject]@{ Name = "Export $($export.Id)"; Acc = $acc; PartSizes = @($export.Files | ForEach-Object { [long]$_.size }) }
+    }
+    Show-ReviewReport @($reviews)
+}
+
+function Invoke-DriveImport {
+    $state = Read-State
+    $toDo = @(Get-ExportsToProcess $state)
+    if ($toDo.Count -eq 0) { return }
 
     [void][IO.Directory]::CreateDirectory($Config.StagingDirectory)
     foreach ($export in $toDo) {
-        Write-Log "Importing export $($export.Id)..."
+        if ($Config.DownloadOnly) { Write-Log "Downloading export $($export.Id) (download only)..." } else { Write-Log "Importing export $($export.Id)..." }
         $errorsBefore = $script:Stats.Errors
         Reset-Metadata
         $pending = New-Object Collections.Generic.List[object]
@@ -1001,17 +1341,22 @@ function Invoke-DriveImport {
         foreach ($file in $export.Files) {
             $n++
             $local = Join-Path $Config.StagingDirectory $file.name
+            $label = ' (part {0} of {1})' -f $n, $export.Files.Count
             if (-not (Test-Path -LiteralPath $local)) {
                 $partial = 0L
                 if (Test-Path -LiteralPath "$local.part") { $partial = (Get-Item -LiteralPath "$local.part").Length }
                 Assert-FreeSpace $Config.StagingDirectory ([long]$file.size - $partial)
                 Write-Log ('[{0}/{1}] Downloading {2} ({3})...' -f $n, $export.Files.Count, $file.name, (Format-GB ([long]$file.size)))
             }
-            Save-DriveFile $file $local
+            Save-DriveFile $file $local $label
+            $script:Downloaded.Parts++
+            $script:Downloaded.Bytes += [long]$file.size
+            if ($Config.DownloadOnly) { continue }
             $partErrors = $script:Stats.Errors
             Import-TakeoutPart $local $pending
             if ($Config.DeleteStagedArchives -and $script:Stats.Errors -eq $partErrors) { Remove-Item -LiteralPath $local -Force }
         }
+        if ($Config.DownloadOnly) { continue }
         Complete-PendingTimes $pending
 
         if ($DryRun) {
@@ -1049,26 +1394,43 @@ try {
     if ($SignIn -and $SignOut) { throw 'Use either -SignIn or -SignOut, not both.' }
     if ($SignOut) { Invoke-SignOut; exit 0 }
     if ($SignIn) { Invoke-SignIn; exit 0 }
+    if ($Review -and $Config.DownloadOnly) { throw 'Use either -Review or -DownloadOnly, not both.' }
+    if ($Config.DownloadOnly -and $SourcePath) { throw '-DownloadOnly downloads from Google Drive, so it cannot be combined with -SourcePath.' }
 
     $mode = 'Google Drive'
     if ($SourcePath) { $mode = 'local files' }
-    $dry = ''
-    if ($DryRun) { $dry = ' [DRY RUN - nothing will be written]' }
-    Write-Log "Google Photos Sync starting. Source: $mode. Destination: $($Config.Destination)$dry"
+    $what = "Destination: $($Config.Destination)"
+    if ($Review) { $what = 'REVIEW ONLY - nothing will be downloaded or written' }
+    elseif ($Config.DownloadOnly) { $what = "DOWNLOAD ONLY - archives go to $($Config.StagingDirectory)" }
+    elseif ($DryRun) { $what += ' [DRY RUN - nothing will be written to it]' }
+    Write-Log "Google Photos Sync starting. Source: $mode. $what"
     Write-Log "Log file: $logPath"
 
-    Assert-Destination
-    Import-HashCache
-    $started = $true
-
-    if ($SourcePath) {
+    if ($SourcePath -and $Review) {
+        Invoke-LocalReview
+    } elseif ($Review) {
+        if ($Config.SignOutWhenDone) { $script:SignOutPending = $true }
+        Invoke-DriveReview
+    } elseif ($SourcePath) {
+        Assert-Destination
+        Import-HashCache
+        $started = $true
         Invoke-LocalImport
     } else {
         if ($Config.SignOutWhenDone -and $Unattended) {
             Write-Log 'SignOutWhenDone is on, so the next unattended run will not be able to sign in. Run with -SignIn before it.' WARN
         }
         $script:SignOutPending = [bool]$Config.SignOutWhenDone
+        if (-not $Config.DownloadOnly) {
+            Assert-Destination
+            Import-HashCache
+            $started = $true
+        }
         Invoke-DriveImport
+        if ($Config.DownloadOnly -and $script:Downloaded.Parts -gt 0) {
+            Write-Log ('Download complete: {0} archive part(s), {1}, saved in {2}' -f $script:Downloaded.Parts, (Format-GB $script:Downloaded.Bytes), $Config.StagingDirectory)
+            Write-Log "Nothing was unzipped. To unzip them later: GooglePhotosSync.ps1 -SourcePath `"$($Config.StagingDirectory)`""
+        }
     }
 } catch {
     $exitCode = 2

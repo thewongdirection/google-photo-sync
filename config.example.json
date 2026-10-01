@@ -1,6 +1,7 @@
 {
     "_comment": "Copy to config.json and edit. Backslashes must be doubled in JSON, e.g. \\\\nas\\photos",
 
+    "_comment2": "Destination is where the photos are unzipped to. Leave it out to use a folder named Takeout in the current directory.",
     "Destination": "\\\\nas\\photos\\Google Photos",
 
     "ClientSecretFile": "client_secret.json",
@@ -14,5 +15,6 @@
     "SetFileTimes": true,
     "CopyJsonSidecars": false,
     "DeleteStagedArchives": true,
-    "SignOutWhenDone": false
+    "SignOutWhenDone": false,
+    "DownloadOnly": false
 }

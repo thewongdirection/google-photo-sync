@@ -22,6 +22,10 @@ script takes over the work after that:
 | Unzip every part and merge the folders. A photo's `.json` metadata file can land in a different part from the photo. | Reads the zips directly and merges all parts into one folder layout, with no manual unzipping. Metadata that sits in a different part from its photo is still matched. |
 | File dates: Takeout stamps files with the export date, not when the photo was taken, so everything sorts wrongly. Fixing this by hand means reading the `.json` files, which isn't realistic. | Sets each file's date from the "photo taken" time in its `.json` file. |
 | Merging folders in Explorer asks you to overwrite or skip each clash. | Skips files that are identical, and keeps both versions of different files, renaming the new one `(gphotos-collision-N)`. Nothing is overwritten. |
+| Finding out how many photos there are and how much disk space you need. Takeout only tells you the archive size, and you find out the unzipped size by downloading and unzipping everything. | `-Review` reads each archive's table of contents without downloading it, and reports the photo and video counts, the unzipped size, and the space needed against what's free. |
+| Choosing where files end up: browsers save to Downloads, and you unzip and move things by hand. | Unzips straight into one folder you choose with `-ExtractTo` (default: `Takeout` in the current directory), including network (SMB) folders. |
+| Downloading everything first and dealing with it later. | `-DownloadOnly` fetches and verifies the archives and stops. Unzip them later with `-SourcePath`. |
+| Watching progress, or guessing whether it's stuck. | Progress bars for downloading and unzipping show the amount done, speed and time left. When output is captured, a line is logged every 10%. |
 | Repeating all this for each new export. | Imports only exports it hasn't seen, so re-running is safe. It can run on a schedule, and it works with network (SMB) folders. |
 
 <!-- MAINTAINER NOTE: when you add, change or remove a script feature, update this table so it
@@ -58,9 +62,12 @@ script takes over the work after that:
   libraries, many archive parts, or repeated exports.
 - **Windows only.** The saved sign-in is encrypted with Windows DPAPI, so the script needs
   Windows PowerShell 5.1 or PowerShell 7 on Windows.
+- **`-Review` can't read `.tgz` exports.** It leaves them out of the report. Use the `.zip` file
+  type when creating the export.
 - **Tested so far** on a small export (62 photos, one album) plus synthetic test archives, on both
-  PowerShell versions. It hasn't been run on a library of 100 GB or more, on `.tgz` exports, or
-  against a network (SMB) destination.
+  PowerShell versions. That covered review, download-only and unzipping, with the zip64 table of
+  contents used by archives over 4 GB tested on hand-built data. It hasn't been run on a library of
+  100 GB or more, on `.tgz` exports, or against a network (SMB) destination.
 
 ## What it does
 
@@ -69,8 +76,10 @@ script takes over the work after that:
 2. Finds the Takeout archives (`takeout-*.zip`) that Takeout delivered to your Drive.
 3. Downloads them one part at a time. Downloads resume if interrupted and are checked against
    Google's checksum.
-4. Copies the photos and videos into your destination folder, for example
-   `Destination\Photos from 2023\IMG_1234.JPG` or `Destination\<Album name>\...`.
+4. Unzips the photos and videos into your destination folder (`Takeout` in the current directory by
+   default), for example `Takeout\Photos from 2023\IMG_1234.JPG` or `Takeout\<Album name>\...`.
+   Takeout's extra `Takeout\Google Photos\` folders are left out, and all archive parts are merged
+   into the one folder.
 5. Sets each file's date to when the photo was **taken**, using Takeout's `.json` metadata files.
 6. Remembers which exports it has imported, so a scheduled run only acts on new ones.
 
@@ -141,14 +150,16 @@ after they've been imported. The script logs when an export is safe to delete.
 
 ### 3. Configure
 
-Copy `config.example.json` to `config.json` and set `Destination`. Backslashes must be doubled in
-JSON: `"\\\\nas\\photos\\Google Photos"` means `\\nas\photos\Google Photos`.
+A config file is optional. Without one, the photos are unzipped into a folder named `Takeout` in the
+folder you run the script from. To change that, either pass `-ExtractTo <folder>` on the command
+line, or copy `config.example.json` to `config.json` and set `Destination`. Backslashes must be
+doubled in JSON: `"\\\\nas\\photos\\Google Photos"` means `\\nas\photos\Google Photos`.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `Destination` | *(required)* | Local folder or UNC path the photos are copied into. |
+| `Destination` | `Takeout` in the current directory | The folder the photos are unzipped into. Local folder or UNC path. A relative path in `config.json` is relative to the script; one given with `-ExtractTo` is relative to the current directory. |
 | `ClientSecretFile` | `client_secret.json` | The OAuth client JSON from step 1. Relative paths are relative to the script. |
-| `StagingDirectory` | `%LOCALAPPDATA%\GooglePhotosSync\staging` | Where archive parts are downloaded. Needs free space for one part (up to 50 GB). |
+| `StagingDirectory` | `%LOCALAPPDATA%\GooglePhotosSync\staging` | Where archive parts are downloaded. Needs free space for one part (up to 50 GB), or for all parts with `-DownloadOnly`. |
 | `StateDirectory` | `%LOCALAPPDATA%\GooglePhotosSync` | Saved sign-in, import history, hash cache and logs. |
 | `ExportSelection` | `Latest` | `Latest` imports only the newest export, since each one is a full copy. `AllUnprocessed` imports every export not yet imported. |
 | `ProductFolder` | *(auto)* | Name of the Photos folder inside Takeout. Only needed if detection fails, for example when an export includes other Google products. |
@@ -157,6 +168,7 @@ JSON: `"\\\\nas\\photos\\Google Photos"` means `\\nas\photos\Google Photos`.
 | `CopyJsonSidecars` | `false` | Also copy Takeout's `.json` metadata files. |
 | `DeleteStagedArchives` | `true` | Delete each downloaded part once it has been imported without errors. |
 | `SignOutWhenDone` | `false` | Sign out of Google after every Drive run (see [Your Google sign-in](#your-google-sign-in)). |
+| `DownloadOnly` | `false` | Download the archives and stop, without unzipping (see [Download only](#download-only)). |
 
 ## Running it
 
@@ -164,12 +176,22 @@ JSON: `"\\\\nas\\photos\\Google Photos"` means `\\nas\photos\Google Photos`.
 powershell -ExecutionPolicy Bypass -File .\GooglePhotosSync.ps1
 ```
 
+Downloading and unzipping each show a progress bar with the amount done, speed and time left. When
+the output is being captured instead of shown in a console, such as in a scheduled task, a line is
+logged at every 10% instead.
+
 Useful options:
 
-- `-DryRun` shows what would be copied without writing anything.
+- `-ExtractTo <folder>` (also `-Destination`) is the folder to unzip into. The default is a folder
+  named `Takeout` in the current directory. It can be a network path such as `\\nas\photos`.
+- `-Review` reports how many photos and videos there are and how much disk space is needed, and
+  stops there (see below).
+- `-DownloadOnly` downloads the archives and doesn't unzip them (see below).
+- `-StagingDirectory <folder>` is where archives are downloaded to.
+- `-DryRun` shows what would be copied without writing anything to the destination. It still
+  downloads the archives; use `-Review` to avoid that.
 - `-SourcePath <path>` imports Takeout archives you already downloaded (a `.zip`/`.tgz`, a folder
   of them, or an extracted `Takeout` folder). No Google sign-in is needed.
-- `-Destination <path>` overrides the config.
 - `-SignIn` / `-SignOut` / `-SignOutWhenDone` / `-Unattended` manage the saved Google sign-in
   (see below).
 - `-ReAuthenticate` signs in to Google again, for example to switch accounts.
@@ -177,6 +199,46 @@ Useful options:
 - `-Verbose` shows every copied file. Every file is always recorded in the log.
 
 Exit codes: `0` means OK, `1` means some files failed (see the log), `2` means a fatal error.
+
+### Reviewing size and disk space first
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\GooglePhotosSync.ps1 -Review
+```
+
+This shows, for the export(s) a normal run would import:
+
+- the number of archive parts and how much has to be downloaded,
+- how many files there are, split into photos, videos and other, and how much space they take once
+  unzipped,
+- roughly how many *unique* photos that is (a photo that is also in an album is counted once),
+- how much disk space is needed in the download folder and in the destination, against how much
+  is free on each (this works for network folders too).
+
+Nothing is downloaded or written. For exports in Google Drive, the script reads only the table of
+contents at the end of each archive, so even a 50 GB part takes a few seconds. Add `-Reprocess` to
+review an export that was already imported. `.tgz` archives can't be reviewed this way and are
+left out of the report. You can also review archives you already have, with `-SourcePath`.
+
+The numbers are for the whole export. Files already in the destination are skipped, so a repeat
+import needs less space.
+
+### Download only
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\GooglePhotosSync.ps1 -DownloadOnly
+```
+
+Downloads the archives and stops. Nothing is unzipped, and the export isn't marked as imported.
+The archives stay in the staging folder (`-StagingDirectory`), and the script prints where. Use
+this to fetch everything first, for example overnight or onto a large drive, and unzip later:
+
+```bash
+powershell -ExecutionPolicy Bypass -File .\GooglePhotosSync.ps1 -SourcePath "<staging folder>" -ExtractTo D:\Photos
+```
+
+A normal run afterwards, with the same staging folder, finds the downloaded archives and uses them
+instead of downloading again. Download only is off by default.
 
 ### Your Google sign-in
 
